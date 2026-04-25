@@ -1,0 +1,180 @@
+cat /opt/CAPEv2/analyzer/windows/data/binsim_stalker.js
+// binsim_stalker.js
+// Phase 1: ES5 Bulletproof Payload + Smart Deferred Hooking
+
+var MAX_INSTRUCTIONS = 2000;
+var instructionBuffer = [];
+
+console.log("[+] BinSim Frida Payload Injected. Booting Smart-Anchor Mode...");
+
+var TARGETS = [
+    // ntdll.dll (Always loaded at millisecond zero)
+    { mod: 'ntdll.dll', api: 'NtCreateFile' },
+    { mod: 'ntdll.dll', api: 'NtOpenFile' },
+    { mod: 'ntdll.dll', api: 'NtClose' },
+    { mod: 'ntdll.dll', api: 'NtQueryDirectoryFile' },
+    { mod: 'ntdll.dll', api: 'NtSetInformationFile' },
+    { mod: 'ntdll.dll', api: 'NtCreateKey' },
+    { mod: 'ntdll.dll', api: 'NtOpenKey' },
+    { mod: 'ntdll.dll', api: 'NtSaveKey' },
+    { mod: 'ntdll.dll', api: 'NtAllocateVirtualMemory' },
+    { mod: 'ntdll.dll', api: 'NtMapViewOfSection' },
+    { mod: 'ntdll.dll', api: 'NtWriteVirtualMemory' },
+    { mod: 'ntdll.dll', api: 'NtCreateProcess' },
+    { mod: 'ntdll.dll', api: 'NtOpenProcess' },
+    { mod: 'ntdll.dll', api: 'NtTerminateProcess' },
+    { mod: 'ntdll.dll', api: 'NtCreateThread' },
+    { mod: 'ntdll.dll', api: 'NtResumeThread' },
+    { mod: 'ntdll.dll', api: 'NtTerminateThread' },
+    // Other DLLs (Loaded later by the OS)
+    { mod: 'ws2_32.dll', api: 'connect' },
+    { mod: 'ws2_32.dll', api: 'bind' },
+    { mod: 'ws2_32.dll', api: 'send' },
+    { mod: 'ws2_32.dll', api: 'recv' },
+    { mod: 'ws2_32.dll', api: 'gethostname' },
+    { mod: 'user32.dll', api: 'CreateDesktopA' },
+    { mod: 'user32.dll', api: 'CreateDesktopW' },
+    { mod: 'user32.dll', api: 'SwitchDesktop' },
+    { mod: 'user32.dll', api: 'SetThreadDesktop' },
+    { mod: 'kernel32.dll', api: 'LoadLibraryA' },
+    { mod: 'kernel32.dll', api: 'LoadLibraryW' },
+    { mod: 'kernel32.dll', api: 'GetProcAddress' },
+    { mod: 'kernel32.dll', api: 'GetModuleHandleA' },
+    { mod: 'kernel32.dll', api: 'GetModuleHandleW' }
+];
+
+var pendingTargets = TARGETS.slice(); // Copy of targets we still need to hook
+var hooksPlaced = 0;
+
+// The function that actually places the wiretap
+function doHook(targetAddress, apiName) {
+    Interceptor.attach(targetAddress, {
+        onEnter: function (args) {
+            if (instructionBuffer.length > 0) {
+                try {
+                    var file = new File("C:\\binsim_trace.json", "a");
+                    var traceEvent = {
+                        api: apiName,
+                        timestamp: new Date().getTime(),
+                        instructions: instructionBuffer
+                    };
+                    file.write(JSON.stringify(traceEvent) + "\n");
+                    file.close();
+                    console.log("[+] Traced Anchor: " + apiName);
+                } catch (e) {}
+            }
+            instructionBuffer = []; // Clear for next anchor hit
+        }
+    });
+    hooksPlaced++;
+}
+
+// Function to scan memory and hook whatever is currently available
+function tryHooking() {
+    var remaining = [];
+    for (var i = 0; i < pendingTargets.length; i++) {
+        var target = pendingTargets[i];
+        var targetAddress = Module.findExportByName(target.mod, target.api);
+        if (targetAddress) {
+            doHook(targetAddress, target.api);
+        } else {
+            remaining.push(target); // Save for later
+        }
+    }
+    pendingTargets = remaining;
+}
+
+// 1. Hook everything that is already loaded (ntdll.dll)
+tryHooking();
+console.log("[+] Initial Hooks Placed (ntdll): " + hooksPlaced);
+
+// 2. Secretly wiretap the Windows Loader!
+// Whenever Windows loads a new DLL (like kernel32 or user32), we immediately scan for pending targets.
+var ldrLoadDll = Module.findExportByName('ntdll.dll', 'LdrLoadDll');
+if (ldrLoadDll) {
+    Interceptor.attach(ldrLoadDll, {
+        onLeave: function (retval) {
+            if (pendingTargets.length > 0) {
+                tryHooking();
+            }
+        }
+    });
+}
+
+// 3. Start the Stalker
+var threads = Process.enumerateThreads();
+if (threads.length > 0) {
+    var mainThreadId = threads[0].id;
+    console.log("[+] Attaching Stalker to main thread: " + mainThreadId);
+
+    Stalker.follow(mainThreadId, {
+        events: { call: false, ret: false, exec: false, block: false, compile: true },
+        transform: function (iterator) {
+            var instruction = iterator.next();
+            while (instruction !== null) {
+                instructionBuffer.push(instruction.address + "|" + instruction.mnemonic + "|" + instruction.opStr);
+                if (instructionBuffer.length > MAX_INSTRUCTIONS) {
+                    instructionBuffer.shift();
+                }
+                iterator.keep();
+                instruction = iterator.next();
+            }
+        }
+    });
+} else {
+    console.log("[-] Failed to enumerate threads.");
+}
+cape@cape-Standard-PC-i440FX-PIIX-1996:~$ cat /opt/CAPEv2/analyzer/windows/modules/packages/binsim.py
+import os
+import shutil
+from lib.common.abstracts import Package
+
+class BinSim(Package):
+    """BinSim Execution Package: Frida + CAPE Synergy"""
+
+    def start(self, path):
+        print("[*] BinSim Package Started...")
+
+        package_dir = os.path.dirname(os.path.abspath(__file__))
+        bundled_js = os.path.normpath(os.path.join(package_dir, "..", "..", "data", "binsim_stalker.js"))
+        frida_script = "C:\\binsim_stalker.js"
+
+        try:
+            if os.path.exists(bundled_js):
+                shutil.copy(bundled_js, frida_script)
+        except Exception as e:
+            print(f"[-] ERROR copying payload: {e}")
+            return None
+
+        try:
+            import frida
+            with open(frida_script, "r", encoding="utf-8") as f:
+                js_code = f.read()
+
+            print(f"[*] Spawning process: {path}")
+            pid = frida.spawn([path])
+
+            session = frida.attach(pid)
+            script = session.create_script(js_code)
+
+            def on_message(message, data):
+                if message['type'] == 'send':
+                    print(f"[FRIDA] {message['payload']}")
+
+            script.on('message', on_message)
+            script.load()
+
+            print("[*] Resuming process execution...")
+            frida.resume(pid)
+
+            # --- THE MAGIC FIX ---
+            # By returning the PID instead of None, CAPE will immediately
+            # inject its own monitor. It will record the standard APIs AND
+            # it will automatically sweep the hard drive and extract our
+            # binsim_trace.json file back to the Linux host!
+            return pid
+
+        except Exception as e:
+            print(f"[-] CRITICAL NATIVE FRIDA CRASH: {e}")
+
+        return None

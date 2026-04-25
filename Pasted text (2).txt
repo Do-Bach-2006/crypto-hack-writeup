@@ -1,0 +1,271 @@
+import os
+import time
+import requests
+import numpy as np
+import json
+import glob
+import sys
+
+# --- CẤU HÌNH CAPEv2 ---
+CAPE_HOST = "http://10.144.5.64:8000"
+API_TOKEN = "5f42b8083e6a6e95bd32ff2037ae323252dcb8ff"
+HEADERS = {"Authorization": f"Token {API_TOKEN}"}
+
+ROOT_DIR = "Test"
+FINAL_OUTPUT_FILE = "Test.npz"
+WORKSPACE_DIR = "progress_Test"
+PROGRESS_LOG = os.path.join(WORKSPACE_DIR, "processed_log.json")
+BATCH_SIZE = 10
+
+
+def ensure_workspace():
+    if not os.path.exists(WORKSPACE_DIR):
+        os.makedirs(WORKSPACE_DIR)
+
+
+def load_processed_set():
+    if os.path.exists(PROGRESS_LOG):
+        try:
+            with open(PROGRESS_LOG, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except:
+            return set()
+    return set()
+
+
+def save_batch_npz(data_dict):
+    if not data_dict["name"]:
+        return
+    count = len(data_dict["name"])
+    timestamp = int(time.time())
+    filename = f"batch_{timestamp}_{count}_samples.npz"
+    filepath = os.path.join(WORKSPACE_DIR, filename)
+    print(f"\n [SAVE] Đang lưu {count} file vào đĩa -> {filename}")
+
+    try:
+        np.savez_compressed(
+            filepath,
+            name=np.array(data_dict["name"]),
+            label=np.array(data_dict["label"]),
+            api=np.array(data_dict["api"], dtype=object),
+            pe_imports=np.array(data_dict["pe_imports"], dtype=object),
+            pe_sections=np.array(data_dict["pe_sections"], dtype=object),
+        )
+    except Exception as e:
+        print(f" [!] Lỗi KHI LƯU FILE NPZ: {e}")
+        return
+
+    current_log = []
+    if os.path.exists(PROGRESS_LOG):
+        try:
+            with open(PROGRESS_LOG, "r", encoding="utf-8") as f:
+                current_log = json.load(f)
+        except:
+            pass
+
+    current_log.extend(data_dict["name"])
+    try:
+        with open(PROGRESS_LOG, "w", encoding="utf-8") as f:
+            json.dump(current_log, f, indent=2)
+    except Exception as e:
+        pass
+
+
+def merge_all_npz():
+    print(f"\n--- GIAI ĐOẠN CUỐI: GỘP TOÀN BỘ FILE ---")
+    npz_files = glob.glob(os.path.join(WORKSPACE_DIR, "*.npz"))
+    if not npz_files:
+        return
+    all_data = {"name": [], "label": [], "api": [], "pe_imports": [], "pe_sections": []}
+
+    for f in npz_files:
+        try:
+            d = np.load(f, allow_pickle=True)
+            for k in all_data.keys():
+                all_data[k].append(d[k])
+        except Exception as e:
+            print(f" [!] Lỗi đọc file {f}: {e}")
+
+    try:
+        np.savez_compressed(
+            FINAL_OUTPUT_FILE, **{k: np.concatenate(v) for k, v in all_data.items()}
+        )
+        print(f" [DONE] Đã lưu file cuối: {FINAL_OUTPUT_FILE}")
+    except Exception as e:
+        print(f" [!] Lỗi khi gộp file: {e}")
+
+
+def submit_to_cape(file_path):
+    url = f"{CAPE_HOST}/apiv2/tasks/create/file/"
+
+    # THE FIX: Keeping your safe parameters, but adding 'machine' and 'package'
+    options_str = "sniffer=0,procmemdump=0,dumpprocess=0,dump_r0=0,curtain=0,sysmon=0"
+    data_params = {
+        "timeout": 60,  # Safe API timeout
+        "platform": "windows",
+        "machine": "win10",  # Explicitly lock to win10
+        "package": "binsim",  # Trigger the Frida Stalker pipeline
+        "enforce_timeout": False,  # Must stay False to prevent API crash!
+        "options": options_str,
+    }
+
+    while True:
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (os.path.basename(file_path), f)}
+                r = requests.post(
+                    url, headers=HEADERS, files=files, data=data_params, timeout=30
+                )
+                if r.status_code == 200:
+                    task_ids = r.json().get("data", {}).get("task_ids", [])
+                    if task_ids:
+                        return task_ids[0]
+                elif r.status_code >= 500:
+                    time.sleep(15)
+                    continue
+                else:
+                    return None
+        except Exception as e:
+            time.sleep(10)
+
+
+def wait_for_report(task_id):
+    status_url = f"{CAPE_HOST}/apiv2/tasks/view/{task_id}/"
+    report_url = f"{CAPE_HOST}/apiv2/tasks/get/report/{task_id}/json/"
+    print(f"[*] Đợi Task {task_id}...", end="", flush=True)
+
+    for i in range(240):
+        try:
+            r = requests.get(status_url, headers=HEADERS, timeout=10)
+            if r.status_code == 200:
+                status = r.json().get("data", {}).get("status")
+                if status in ["reported", "failed_analysis", "timeout", "completed"]:
+                    rep_req = requests.get(report_url, headers=HEADERS, timeout=60)
+                    if rep_req.status_code == 200:
+                        report_data = rep_req.json()
+                        if report_data.get("error") is True:
+                            time.sleep(5)
+                            continue
+                        print(" OK!")
+                        return report_data
+            time.sleep(10)
+        except Exception:
+            pass
+    return {}
+
+
+def delete_task(task_id):
+    url = f"{CAPE_HOST}/apiv2/tasks/delete/{task_id}/"
+    try:
+        requests.get(url, headers=HEADERS, timeout=10)
+    except:
+        pass
+
+
+def extract_features_raw(report):
+    features = {"api": [], "imports": [], "sections": []}
+    if not report:
+        return features
+    try:
+        for proc in report.get("behavior", {}).get("processes", []):
+            for call in proc.get("calls", []):
+                if isinstance(call, dict) and call.get("api"):
+                    features["api"].append(call["api"])
+    except Exception:
+        pass
+    return features
+
+
+# --- THE BINSIM EXTRACTION FIX ---
+def extract_binsim_trace(report):
+    """
+    Finds the Frida trace by searching the 'dropped' files array inside the JSON report,
+    extracts its SHA256, and downloads the raw JSON content using the Files API.
+    """
+    assembly_slices = []
+    dropped_files = report.get("dropped", [])
+
+    for df in dropped_files:
+        if "binsim_trace.json" in df.get("name", ""):
+            sha256 = df.get("sha256")
+            dl_url = f"{CAPE_HOST}/apiv2/files/get/{sha256}/"
+            try:
+                r = requests.get(dl_url, headers=HEADERS, timeout=30)
+                if r.status_code == 200:
+                    for line in r.text.strip().split("\n"):
+                        if line:
+                            assembly_slices.append(json.loads(line))
+            except Exception as e:
+                print(f" [!] Lỗi tải file Trace: {e}")
+
+    return assembly_slices
+
+
+def main():
+    ensure_workspace()
+    processed_set = load_processed_set()
+    print(f"--- Đã hoàn thành {len(processed_set)} file trước đó (Skip) ---")
+
+    current_batch = {
+        k: [] for k in ["name", "label", "api", "pe_imports", "pe_sections"]
+    }
+
+    try:
+        for root, dirs, files in os.walk(ROOT_DIR):
+            for filename in files:
+                if filename.startswith(".") or filename in processed_set:
+                    continue
+
+                file_path = os.path.join(root, filename)
+                label = os.path.basename(root)
+                print(f"\n>>> File: {filename} | Label: {label}")
+
+                start_time = time.time()
+                tid = submit_to_cape(file_path)
+                if not tid:
+                    continue
+
+                report = wait_for_report(tid)
+                feats = extract_features_raw(report)
+
+                # ---> EXTRACT THE SYSCALL SLICES <---
+                frida_assembly = extract_binsim_trace(report)
+
+                duration = time.time() - start_time
+                print(
+                    f"   [RESULT] API: {len(feats['api'])} | Binsim Trace Blocks: {len(frida_assembly)}"
+                )
+                print(f"   [TIME]   Hoàn thành trong: {duration:.2f}s")
+
+                # Save the syscall slicing trace cleanly to an individual JSON file
+                if frida_assembly:
+                    trace_path = os.path.join(
+                        WORKSPACE_DIR, f"{filename}_syscall_trace.json"
+                    )
+                    with open(trace_path, "w", encoding="utf-8") as f:
+                        json.dump(frida_assembly, f, indent=4)
+                    print(f"   [SAVE]   Đã lưu Syscall Trace -> {trace_path}")
+
+                current_batch["name"].append(filename)
+                current_batch["label"].append(label)
+                current_batch["api"].append(np.array(feats["api"]))
+                current_batch["pe_imports"].append(np.array(feats["imports"]))
+                current_batch["pe_sections"].append(feats["sections"])
+                processed_set.add(filename)
+
+                delete_task(tid)
+
+                if len(current_batch["name"]) >= BATCH_SIZE:
+                    save_batch_npz(current_batch)
+                    current_batch = {k: [] for k in current_batch}
+
+    except KeyboardInterrupt:
+        print("\n\n [STOP] ĐANG DỪNG BỞI NGƯỜI DÙNG...")
+    finally:
+        if len(current_batch["name"]) > 0:
+            save_batch_npz(current_batch)
+        merge_all_npz()
+
+
+if __name__ == "__main__":
+    main()
